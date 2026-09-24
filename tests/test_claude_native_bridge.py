@@ -11897,6 +11897,40 @@ def test_draft_in_input_box_ignores_a_transcript_echo_outside_the_frame() -> Non
     )
 
 
+_SHORTCUTS_PANEL_WITH_DRAFT_PANE = """\
+──────────────────────────────
+❯ fix the flaky test
+──────────────────────────────
+  ! for shell mode        double tap esc to clear input
+  / for commands          shift + tab to auto-accept edits
+"""
+
+_SHORTCUTS_PANEL_WITH_STRANDED_PLACEHOLDER_PANE = """\
+──────────────────────────────
+❯
+  [Pasted text #1 +3 lines]
+──────────────────────────────
+  ! for shell mode        double tap esc to clear input
+  / for commands          shift + tab to auto-accept edits
+"""
+
+
+def test_draft_in_input_box_reads_the_composer_above_the_shortcuts_panel() -> None:
+    """
+    With the ``?`` shortcuts panel expanded, its "! for shell mode" row sits
+    directly under the box's closing rule and starts with the shell-mode
+    glyph. The composer region must stay the framed box above it, so a draft
+    still sitting there — verbatim or stranded as the placeholder below an
+    empty glyph row — keeps reading as present.
+    """
+    assert claude_native_bridge._draft_in_input_box(
+        _SHORTCUTS_PANEL_WITH_DRAFT_PANE, "fix the flaky test"
+    )
+    assert claude_native_bridge._draft_in_input_box(
+        _SHORTCUTS_PANEL_WITH_STRANDED_PLACEHOLDER_PANE, "ignored"
+    )
+
+
 def test_inject_user_message_retries_enter_until_the_submit_hook_records(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

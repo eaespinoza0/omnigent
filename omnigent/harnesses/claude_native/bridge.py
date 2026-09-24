@@ -5797,9 +5797,10 @@ def _composer_region(pane: str) -> str | None:
     rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
     if not rules:
         return None
-    # Normally the final two rules frame the composer. In a very short pane the
-    # closing rule is clipped, making the final rule itself the opening frame.
-    for opening in reversed(rules[-2:]):
+    # Prefer the frame opening at the second-to-last rule: the row under the
+    # last rule can be the shortcuts panel's "! for shell mode" look-alike
+    # (see _composer_row). A clipped pane leaves the last rule as the opener.
+    for opening in rules[-2:]:
         closing = next((idx for idx in rules if idx > opening), len(lines))
         row = opening + 1
         while row < closing and not lines[row].strip():
