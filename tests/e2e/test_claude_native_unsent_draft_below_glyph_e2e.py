@@ -206,8 +206,20 @@ def booting_claude_pane() -> Iterator[tuple[Path, str]]:
 
     subprocess.run(
         [
-            "tmux", "-S", str(socket_path), "new-session", "-d", "-s", "claude",
-            "-x", "80", "-y", "24", sys.executable, str(tui_path), _MESSAGE,
+            "tmux",
+            "-S",
+            str(socket_path),
+            "new-session",
+            "-d",
+            "-s",
+            "claude",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            sys.executable,
+            str(tui_path),
+            _MESSAGE,
         ],
         check=True,
         timeout=30.0,

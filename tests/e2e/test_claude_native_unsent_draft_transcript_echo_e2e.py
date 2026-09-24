@@ -168,7 +168,8 @@ def main():
                     state = "stranded"
                     render(stranded(submitted))
                 elif state == "stranded":
-                    submitted = submitted + [PROMPT_GLYPH + " " + draft.replace("\\r", " ").strip()]
+                    echo = PROMPT_GLYPH + " " + draft.replace("\\r", " ").strip()
+                    submitted = submitted + [echo]
                     draft = ""
                     state = "empty"
                     render(empty_composer(submitted))
@@ -199,8 +200,21 @@ def streaming_claude_pane() -> Iterator[tuple[Path, str]]:
 
     subprocess.run(
         [
-            "tmux", "-S", str(socket_path), "new-session", "-d", "-s", "claude",
-            "-x", "80", "-y", "24", sys.executable, str(tui_path), _MESSAGE, _PRIOR_ECHO,
+            "tmux",
+            "-S",
+            str(socket_path),
+            "new-session",
+            "-d",
+            "-s",
+            "claude",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            sys.executable,
+            str(tui_path),
+            _MESSAGE,
+            _PRIOR_ECHO,
         ],
         check=True,
         timeout=30.0,
