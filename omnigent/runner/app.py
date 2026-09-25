@@ -1617,6 +1617,10 @@ class _SubagentWorkEntry:
         terminal status, or ``None`` while running.
     :param delivered: Whether the terminal payload has been pushed to
         the parent's inbox.
+    :param launch_timed_out: Whether the recorded ``failed`` came from the
+        launch-liveness reaper rather than from the child itself. Such a
+        failure is a guess ("no start acknowledgment"), so a genuine
+        terminal edge from the child afterwards must replace it.
     """
 
     parent_session_id: str
@@ -1631,6 +1635,7 @@ class _SubagentWorkEntry:
     created_at: float = dataclasses.field(default_factory=time.time)
     completed_at: float | None = None
     delivered: bool = False
+    launch_timed_out: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1810,6 +1815,24 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     if entry.status in {"launching", "waiting"}:
         entry.status = "running"
     return entry
+
+
+def acknowledge_native_dispatch_delivery(child_session_id: str) -> _SubagentWorkEntry | None:
+    """
+    Promote a ``launching`` dispatch to ``running`` once its prompt was delivered.
+
+    For a native child the runner injects the message into the harness
+    terminal itself and only reports the turn as started once the paste was
+    verifiably submitted. That is first-hand proof the child is working, so
+    the launch-liveness budget must stop counting here even if no
+    ``running`` status edge is relayed back (a follow-up sent to an already
+    active child produces none). Without this, the reaper fails the dispatch
+    at the budget while the child is mid-turn.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: The entry, or ``None`` when the session is not a tracked dispatch.
+    """
+    return mark_subagent_work_started(child_session_id)
 
 
 def unregister_subagent_work(
@@ -2149,6 +2172,18 @@ def mark_subagent_work_terminal(
             entry.completed_at = time.time()
             entry.delivered = False
             return _deliver_subagent_completion(entry)
+        # A launch-liveness ``failed`` is a guess made without any edge from
+        # the child ("no start acknowledgment"). The child's own terminal
+        # edge afterwards is the truth: replace the guess and deliver it, or
+        # the parent keeps waiting on a result that is sitting in the
+        # child's transcript.
+        if entry.launch_timed_out and status in ("completed", "failed"):
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.delivered = False
+            entry.launch_timed_out = False
+            return _deliver_subagent_completion(entry)
         if entry.delivered:
             return _SubagentDeliveryAck(
                 entry=entry,
@@ -2269,6 +2304,7 @@ def reap_stalled_subagent_launches(
             entry.parent_session_id,
             entry.child_session_id,
         )
+        entry.launch_timed_out = True
         deliver(
             entry.child_session_id,
             status="failed",
@@ -7614,6 +7650,12 @@ def create_runner_app(
                 status="completed",
                 output=_extract_last_assistant_text(conv_id),
             )
+        elif _is_native_harness(conv_id):
+            # The native turn "ended" here means the prompt was delivered to
+            # the terminal (verified submit); the child's real completion
+            # arrives later on its status edge. Count the delivery as the
+            # launch acknowledgment so the reaper leaves this dispatch alone.
+            acknowledge_native_dispatch_delivery(conv_id)
         try:
             loop = asyncio.get_running_loop()
             _cont = loop.create_task(
