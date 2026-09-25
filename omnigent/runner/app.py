@@ -1812,6 +1812,25 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     return entry
 
 
+def forget_drained_subagent_delivery(child_session_id: str) -> bool:
+    """
+    Stop treating *child_session_id*'s next terminal edge as already delivered.
+
+    ``sys_read_inbox`` remembers a drained child so the PTY watcher's trailing
+    ``idle`` after the delivered ``Stop`` is not pushed to the parent twice.
+    That memory must end when the child does new work — a self-resumed turn
+    (Claude Code continuing after a background task or subagent hand-back)
+    ends with a real result the parent has never seen.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: ``True`` when the child was remembered as drained.
+    """
+    if child_session_id in _drained_delivered_subagent_children:
+        _drained_delivered_subagent_children.discard(child_session_id)
+        return True
+    return False
+
+
 def unregister_subagent_work(
     child_session_id: str,
     *,
@@ -5505,6 +5524,24 @@ def create_runner_app(
             return existing
         if conv_id in _drained_delivered_subagent_children:
             return None
+        # The runner's own child registration is authoritative when the
+        # parent's inbox lives here (that is what the parent's dispatch
+        # recorded); the server snapshot is the fallback for a child adopted
+        # after a restart. A parent with no inbox on this runner keeps the
+        # snapshot path so a mirrored child is not turned into a delivery.
+        local_meta = _child_session_parents.get(conv_id)
+        if (
+            local_meta is not None
+            and local_meta.parent_id
+            and local_meta.parent_id != conv_id
+            and local_meta.parent_id in _session_inboxes_ref
+        ):
+            return register_subagent_work(
+                parent_session_id=local_meta.parent_id,
+                child_session_id=conv_id,
+                agent=local_meta.tool or "sub-agent",
+                title=local_meta.session_name or "",
+            )
         try:
             snapshot = await _session_snapshot(conv_id)
         except Exception:  # noqa: BLE001 — best-effort recovery
@@ -10100,6 +10137,14 @@ def create_runner_app(
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
+            if status in ("running", "waiting"):
+                # A child whose delivered result the parent already drained is
+                # remembered so its trailing idle is not re-delivered. New
+                # activity means new work (Claude Code resumes a session on
+                # its own when a background task or subagent finishes), so
+                # forget the drain: the next terminal edge is a fresh result
+                # the parent has not seen, not a duplicate.
+                forget_drained_subagent_delivery(conversation_id)
             if status in ("idle", "failed"):
                 recovered_entry = await _ensure_subagent_work_entry(conversation_id)
             if status == "idle":
