@@ -463,8 +463,8 @@ async def test_native_prompt_delivery_acknowledges_the_launch() -> None:
         parent_session_id=parent_id, child_session_id=child_id, agent="claude-native", title="x"
     )
     try:
-        assert runner_app.acknowledge_native_dispatch_delivery(uuid.uuid4().hex) is None
-        assert runner_app.acknowledge_native_dispatch_delivery(child_id) is entry
+        assert runner_app.mark_subagent_work_started(uuid.uuid4().hex) is None
+        assert runner_app.mark_subagent_work_started(child_id) is entry
         assert entry.status == "running"
         assert (
             runner_app.reap_stalled_subagent_launches(
