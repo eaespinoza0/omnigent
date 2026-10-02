@@ -9018,7 +9018,14 @@ def create_runner_app(
                 # above but settle no outcome. Mapping it to ``completed``
                 # reported aborted turns as successes.
                 entry = get_subagent_work(conversation_id)
-                if entry is None or entry.status not in _SUBAGENT_TERMINAL_STATUSES:
+                if (
+                    entry is None
+                    or entry.status not in _SUBAGENT_TERMINAL_STATUSES
+                    or entry.delivered
+                ):
+                    # Nothing to re-attempt once delivered; re-submitting the
+                    # recorded state would also re-spend a provisional
+                    # launch-timeout ``failed`` as if the child reported it.
                     return Response(status_code=204)
                 # An already-settled outcome may still await parent delivery
                 # (the forwarder's 503-retry contract); re-attempt it.

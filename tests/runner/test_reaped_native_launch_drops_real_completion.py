@@ -302,3 +302,143 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
         subagent_work._session_inboxes_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(child_id, None)
+
+
+@pytest.mark.asyncio
+async def test_bare_native_idle_does_not_respend_the_reapers_guess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quiescence ``idle`` from a reaped claude-native child settles nothing.
+
+    Claude's forwarder stamps ``turn_completed`` on a finished turn, so a bare
+    ``idle`` only re-attempts an outcome still awaiting delivery. A delivered
+    launch-timeout ``failed`` is not awaiting anything: re-submitting it would
+    re-deliver the guess as if the child had reported it and spend the
+    provisional flag, dropping the genuine completion that follows.
+    """
+    from omnigent.runner import app as runner_app
+
+    monkeypatch.setattr(claude_native_bridge, "post_tools_changed", lambda *a, **k: None)
+
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    turn_streamed = asyncio.Event()
+    harness = _ScriptedHarnessClient(_turn_frames("resp_steer"), stream_finished=turn_streamed)
+    server_client = _WakeRecordingServerClient(parent_id)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="claude-native",
+        title="impl",
+    )
+
+    try:
+        async with _runner_client(app) as client:
+            # The steered follow-up records the child's harness as claude-native.
+            resp = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": uuid.uuid4().hex,
+                    "model": "test-agent",
+                    "harness_override": "claude-native",
+                    "content": [{"type": "input_text", "text": "status check"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+            await asyncio.wait_for(turn_streamed.wait(), timeout=5.0)
+            await _wait_until(
+                lambda: child_id not in app.state.active_turns,
+                "the steered native turn never ended",
+            )
+
+            # The reaper's guess, read by the parent through the production drain.
+            entry.status = "launching"
+            assert subagent_work.reap_stalled_subagent_launches(
+                now=entry.created_at + 200.0,
+                timeout_s=180.0,
+                mark_terminal=app.state.mark_subagent_terminal_and_wake,
+            ) == [entry]
+            await _wait_until(
+                lambda: any("finished (failed)" in n for n in server_client.wakes()),
+                "the reaper's failure never woke the parent",
+            )
+            notice = await execute_tool(
+                tool_name="sys_read_inbox",
+                arguments="{}",
+                server_client=server_client,  # type: ignore[arg-type]
+                conversation_id=parent_id,
+                session_inbox=inbox,
+            )
+            assert "no start acknowledgment" in notice, notice
+            assert subagent_work.get_subagent_work(child_id) is entry
+            # The parent's wake turn: it reads the notice and goes idle again.
+            resp = await client.post(
+                f"/v1/sessions/{parent_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": uuid.uuid4().hex,
+                    "model": "test-agent",
+                    "harness": "openai-agents",
+                    "content": [{"type": "input_text", "text": "sub-agent finished (failed)"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+            await _wait_until(
+                lambda: parent_id not in app.state.active_turns,
+                "the parent's wake turn never ended",
+            )
+            wakes_before = len(server_client.wakes())
+
+            # The pane goes quiet mid-turn: the PTY watcher's bare idle.
+            resp = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={"type": "external_session_status", "data": {"status": "idle"}},
+            )
+            assert resp.status_code == 204, resp.text
+            assert inbox.empty(), (
+                "a bare quiescence idle re-delivered the reaper's guess to the parent "
+                f"as if the child had reported it: {inbox.get_nowait()!r}"
+            )
+            assert entry.status == "failed" and entry.launch_timed_out, (
+                "a bare quiescence idle spent the provisional launch-timeout flag"
+            )
+            assert len(server_client.wakes()) == wakes_before
+
+            # The genuine completion: Claude's Stop hook stamps turn_completed.
+            final_report = "FINAL REPORT: implemented the feature and wrote tests"
+            resp = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "output": final_report, "turn_completed": True},
+                },
+            )
+            assert resp.status_code == 204, resp.text
+            assert entry.status == "completed" and entry.output == final_report
+            await _wait_until(
+                lambda: len(server_client.wakes()) > wakes_before,
+                "the parent was never woken for the completion",
+            )
+            report = await execute_tool(
+                tool_name="sys_read_inbox",
+                arguments="{}",
+                server_client=server_client,  # type: ignore[arg-type]
+                conversation_id=parent_id,
+                session_inbox=inbox,
+            )
+            assert final_report in report, report
+            assert subagent_work.get_subagent_work(child_id) is None
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+        runner_app._session_event_queues_ref.pop(parent_id, None)
+        runner_app._session_event_queues_ref.pop(child_id, None)
