@@ -32,7 +32,7 @@ from typing import Any
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, subagent_work
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -105,8 +105,8 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
         process_manager=_FakeProcessManager(_ScriptedHarnessClient(_turn_frames("resp_wake"))),  # type: ignore[arg-type]
         server_client=server_client,  # type: ignore[arg-type]
     )
-    runner_app._session_inboxes_ref[parent_id] = inbox
-    entry = runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="claude-native",
@@ -117,7 +117,7 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
         # The steered native turn relays no running edge, so the entry is still
         # "launching" when the budget elapses: the reaper fails it, delivers
         # that guess to the parent inbox and wakes the parent.
-        reaped = runner_app.reap_stalled_subagent_launches(
+        reaped = subagent_work.reap_stalled_subagent_launches(
             now=entry.created_at + 200.0,
             timeout_s=180.0,
             mark_terminal=app.state.mark_subagent_terminal_and_wake,
@@ -166,7 +166,7 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
             )
             assert resp.status_code == 204, resp.text
 
-            entry = runner_app.get_subagent_work(child_id)
+            entry = subagent_work.get_subagent_work(child_id)
             assert entry is not None
             assert entry.status == "completed", (
                 f"work entry is {entry.status!r} after the child's real completion "
@@ -197,8 +197,8 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
             )
             assert "finished (completed)" in server_client.wakes()[-1]
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(child_id, None)
 
@@ -230,8 +230,8 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
         process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    runner_app._session_inboxes_ref[parent_id] = inbox
-    entry = runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="claude-native",
@@ -269,7 +269,7 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
             f"even though claude-native relays no running edge for a steered turn."
         )
         assert (
-            runner_app.reap_stalled_subagent_launches(
+            subagent_work.reap_stalled_subagent_launches(
                 now=entry.created_at + 900.0, timeout_s=180.0
             )
             == []
@@ -277,7 +277,7 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
         assert entry.status == "running"
         assert inbox.empty()
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(child_id, None)
