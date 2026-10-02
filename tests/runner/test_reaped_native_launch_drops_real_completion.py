@@ -305,16 +305,18 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("inbox_present_at_reap", [True, False], ids=["drained", "undelivered"])
 async def test_bare_native_idle_does_not_respend_the_reapers_guess(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, inbox_present_at_reap: bool
 ) -> None:
     """A quiescence ``idle`` from a reaped claude-native child settles nothing.
 
     Claude's forwarder stamps ``turn_completed`` on a finished turn, so a bare
-    ``idle`` only re-attempts an outcome still awaiting delivery. A delivered
-    launch-timeout ``failed`` is not awaiting anything: re-submitting it would
-    re-deliver the guess as if the child had reported it and spend the
-    provisional flag, dropping the genuine completion that follows.
+    ``idle`` only retries delivery of an outcome still awaiting it. Re-reporting
+    the recorded launch-timeout ``failed`` as the child's own terminal edge
+    would spend the provisional flag (and, once drained, re-deliver the guess),
+    dropping the genuine completion that follows -- whether the parent already
+    read the guess or its inbox was missing when the reaper fired.
     """
     from omnigent.runner import app as runner_app
 
@@ -330,7 +332,8 @@ async def test_bare_native_idle_does_not_respend_the_reapers_guess(
         process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
         server_client=server_client,  # type: ignore[arg-type]
     )
-    subagent_work._session_inboxes_ref[parent_id] = inbox
+    if inbox_present_at_reap:
+        subagent_work._session_inboxes_ref[parent_id] = inbox
     entry = subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
@@ -340,7 +343,49 @@ async def test_bare_native_idle_does_not_respend_the_reapers_guess(
 
     try:
         async with _runner_client(app) as client:
-            # The steered follow-up records the child's harness as claude-native.
+            assert subagent_work.reap_stalled_subagent_launches(
+                now=entry.created_at + 200.0,
+                timeout_s=180.0,
+                mark_terminal=app.state.mark_subagent_terminal_and_wake,
+            ) == [entry]
+            assert entry.status == "failed" and entry.launch_timed_out
+            if inbox_present_at_reap:
+                # The parent is woken, reads the notice through the production
+                # drain, and its wake turn goes idle again.
+                await _wait_until(
+                    lambda: any("finished (failed)" in n for n in server_client.wakes()),
+                    "the reaper's failure never woke the parent",
+                )
+                notice = await execute_tool(
+                    tool_name="sys_read_inbox",
+                    arguments="{}",
+                    server_client=server_client,  # type: ignore[arg-type]
+                    conversation_id=parent_id,
+                    session_inbox=inbox,
+                )
+                assert "no start acknowledgment" in notice, notice
+                assert subagent_work.get_subagent_work(child_id) is entry
+                resp = await client.post(
+                    f"/v1/sessions/{parent_id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": uuid.uuid4().hex,
+                        "model": "test-agent",
+                        "harness": "openai-agents",
+                        "content": [{"type": "input_text", "text": "sub-agent finished (failed)"}],
+                    },
+                )
+                assert resp.status_code == 202, resp.text
+                await _wait_until(
+                    lambda: parent_id not in app.state.active_turns,
+                    "the parent's wake turn never ended",
+                )
+            else:
+                assert not entry.delivered and not server_client.wakes()
+
+            # The steered follow-up records the child's harness as claude-native;
+            # its clean end acknowledges nothing for an already-settled entry.
             resp = await client.post(
                 f"/v1/sessions/{child_id}/events",
                 json={
@@ -358,44 +403,7 @@ async def test_bare_native_idle_does_not_respend_the_reapers_guess(
                 lambda: child_id not in app.state.active_turns,
                 "the steered native turn never ended",
             )
-
-            # The reaper's guess, read by the parent through the production drain.
-            entry.status = "launching"
-            assert subagent_work.reap_stalled_subagent_launches(
-                now=entry.created_at + 200.0,
-                timeout_s=180.0,
-                mark_terminal=app.state.mark_subagent_terminal_and_wake,
-            ) == [entry]
-            await _wait_until(
-                lambda: any("finished (failed)" in n for n in server_client.wakes()),
-                "the reaper's failure never woke the parent",
-            )
-            notice = await execute_tool(
-                tool_name="sys_read_inbox",
-                arguments="{}",
-                server_client=server_client,  # type: ignore[arg-type]
-                conversation_id=parent_id,
-                session_inbox=inbox,
-            )
-            assert "no start acknowledgment" in notice, notice
-            assert subagent_work.get_subagent_work(child_id) is entry
-            # The parent's wake turn: it reads the notice and goes idle again.
-            resp = await client.post(
-                f"/v1/sessions/{parent_id}/events",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "agent_id": uuid.uuid4().hex,
-                    "model": "test-agent",
-                    "harness": "openai-agents",
-                    "content": [{"type": "input_text", "text": "sub-agent finished (failed)"}],
-                },
-            )
-            assert resp.status_code == 202, resp.text
-            await _wait_until(
-                lambda: parent_id not in app.state.active_turns,
-                "the parent's wake turn never ended",
-            )
+            assert entry.status == "failed"
             wakes_before = len(server_client.wakes())
 
             # The pane goes quiet mid-turn: the PTY watcher's bare idle.
@@ -403,15 +411,24 @@ async def test_bare_native_idle_does_not_respend_the_reapers_guess(
                 f"/v1/sessions/{child_id}/events",
                 json={"type": "external_session_status", "data": {"status": "idle"}},
             )
-            assert resp.status_code == 204, resp.text
-            assert inbox.empty(), (
-                "a bare quiescence idle re-delivered the reaper's guess to the parent "
-                f"as if the child had reported it: {inbox.get_nowait()!r}"
-            )
+            if inbox_present_at_reap:
+                assert resp.status_code == 204, resp.text
+                assert inbox.empty(), (
+                    "a bare quiescence idle re-delivered the reaper's guess to the parent "
+                    f"as if the child had reported it: {inbox.get_nowait()!r}"
+                )
+            else:
+                # No parent inbox yet: the retry cannot confirm delivery, so the
+                # forwarder is told to try again later.
+                assert resp.status_code in (204, 503), resp.text
+                assert not entry.delivered
             assert entry.status == "failed" and entry.launch_timed_out, (
                 "a bare quiescence idle spent the provisional launch-timeout flag"
             )
             assert len(server_client.wakes()) == wakes_before
+            if not inbox_present_at_reap:
+                # The parent (re)initializes before the child finishes.
+                subagent_work._session_inboxes_ref[parent_id] = inbox
 
             # The genuine completion: Claude's Stop hook stamps turn_completed.
             final_report = "FINAL REPORT: implemented the feature and wrote tests"
@@ -423,7 +440,10 @@ async def test_bare_native_idle_does_not_respend_the_reapers_guess(
                 },
             )
             assert resp.status_code == 204, resp.text
-            assert entry.status == "completed" and entry.output == final_report
+            assert entry.status == "completed" and entry.output == final_report, (
+                f"work entry is {entry.status!r} with output {entry.output!r}: the "
+                "child's real completion did not supersede the reaper's guess"
+            )
             await _wait_until(
                 lambda: len(server_client.wakes()) > wakes_before,
                 "the parent was never woken for the completion",

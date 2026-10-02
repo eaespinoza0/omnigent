@@ -672,9 +672,7 @@ def mark_subagent_work_terminal(
             entry.completed_at = time.time()
             entry.delivered = False
             return _deliver_subagent_completion(entry)
-        # A launch-liveness ``failed`` is a guess made without any edge from
-        # the child; the child's own terminal edge afterwards is the truth
-        # and must replace it, or the parent waits on a result it never sees.
+        # A child-reported terminal state supersedes the reaper's provisional failure.
         if entry.launch_timed_out and status in ("completed", "failed"):
             entry.status = status
             entry.output = output

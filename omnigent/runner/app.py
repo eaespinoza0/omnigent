@@ -6377,8 +6377,7 @@ def create_runner_app(
                 output=_extract_last_assistant_text(conv_id),
             )
         elif _is_native_harness(conv_id):
-            # A clean native turn end means the prompt was verifiably submitted
-            # into the terminal: first-hand proof the child took it, so the
+            # A clean native turn end acknowledges prompt submission, so the
             # dispatch leaves ``launching`` even when no running edge is relayed.
             mark_subagent_work_started(conv_id)
         try:
@@ -9018,22 +9017,16 @@ def create_runner_app(
                 # above but settle no outcome. Mapping it to ``completed``
                 # reported aborted turns as successes.
                 entry = get_subagent_work(conversation_id)
-                if (
-                    entry is None
-                    or entry.status not in _SUBAGENT_TERMINAL_STATUSES
-                    or entry.delivered
-                ):
-                    # Nothing to re-attempt once delivered; re-submitting the
-                    # recorded state would also re-spend a provisional
-                    # launch-timeout ``failed`` as if the child reported it.
+                if entry is None or entry.status not in _SUBAGENT_TERMINAL_STATUSES:
                     return Response(status_code=204)
                 # An already-settled outcome may still await parent delivery
-                # (the forwarder's 503-retry contract); re-attempt it.
-                delivery_ack = _mark_subagent_terminal_and_wake(
-                    conversation_id,
-                    status=entry.status,
-                    output=entry.output,
-                )
+                # (the forwarder's 503-retry contract): retry the recorded
+                # result as-is. Re-reporting it as a fresh terminal edge would
+                # let a provisional launch-timeout ``failed`` pass for the
+                # child's own report and spend its flag.
+                delivery_ack = _deliver_subagent_completion(entry)
+                if delivery_ack.delivered_now:
+                    _schedule_subagent_wake(entry)
             else:
                 if status in ("idle", "failed"):
                     recovered_entry = await _ensure_subagent_work_entry(conversation_id)
