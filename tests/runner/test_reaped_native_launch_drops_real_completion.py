@@ -1,25 +1,11 @@
-"""Launch-reaped native dispatch must still deliver a child's real completion.
+"""A launch-timeout failure is provisional; a later real result must reach the parent.
 
-A parent sends a follow-up to a busy claude-native child. The steered native
-turn relays no running/waiting edge, so the runner-local work entry stays
-``launching``; once the launch-liveness budget elapses the reaper fails it
-("no start acknowledgment"), delivers that guess to the parent inbox and wakes
-the parent, which reads the notice and goes idle again. The child then
-genuinely finishes and its ``Stop`` hook posts the real
-``external_session_status: idle`` edge. That completion must replace the
-reaper's guess, reach the parent inbox, and wake the parent again.
-
-On the buggy build ``mark_subagent_work_terminal`` sees an already-delivered
-``failed`` entry and returns "already delivered": the real ``completed`` edge
-is discarded, the parent inbox never receives the final report, and the parent
-hangs forever with the result unread. Upstream of that, the runner's own
-verified prompt delivery into the native pane never counted as the launch
-acknowledgment, which is what let the reaper fail a working child.
-
-Both tests drive the runner's real HTTP routes -- ``message`` turns for the
-parent's wake turn and the steered child turn, and the same
-``external_session_status`` POST the claude-native forwarder emits -- so they
-exercise the genuine turn-end and edge-processing paths, not internal helpers.
+The launch-liveness reaper fails a dispatch that never acknowledged its start,
+but that ``failed`` is only a guess: a steered claude-native child relays no
+running edge while it works. These tests drive the runner's real HTTP routes
+and the production ``sys_read_inbox`` drain, so the child's genuine completion
+replaces the guess even after the parent has already read it, reaches the
+inbox, wakes the parent, and only then finalizes the dispatch's cleanup.
 """
 
 from __future__ import annotations
@@ -33,6 +19,7 @@ import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import create_runner_app, subagent_work
+from omnigent.runner.tool_dispatch import execute_tool
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -43,11 +30,16 @@ from tests.runner.helpers import NullServerClient
 
 
 class _WakeRecordingServerClient(NullServerClient):
-    """Records the text of every wake notice POSTed to the parent session."""
+    """Records parent wake notices and child label receipts; allows inbox policy."""
+
+    class _AllowVerdict(NullServerClient._Response):
+        def json(self) -> dict[str, Any]:
+            return {"result": "POLICY_ACTION_UNSPECIFIED"}
 
     def __init__(self, parent_id: str) -> None:
         self._parent_events_path = f"/v1/sessions/{parent_id}/events"
         self.notices: list[str] = []
+        self.label_patches: list[dict[str, Any]] = []
 
     async def post(self, url: str, **kwargs: Any) -> Any:
         if url.rstrip("/").endswith(self._parent_events_path):
@@ -57,7 +49,15 @@ class _WakeRecordingServerClient(NullServerClient):
             except (KeyError, IndexError, TypeError):
                 text = ""
             self.notices.append(text)
+        if url.rstrip("/").endswith("/policies/evaluate"):
+            return self._AllowVerdict()
         return await super().post(url, **kwargs)
+
+    async def patch(self, url: str, **kwargs: Any) -> Any:
+        labels = (kwargs.get("json") or {}).get("labels")
+        if isinstance(labels, dict):
+            self.label_patches.append(labels)
+        return await super().patch(url, **kwargs)
 
     def wakes(self) -> list[str]:
         return [notice for notice in self.notices if "finished (" in notice]
@@ -70,13 +70,6 @@ async def _wait_until(condition: Callable[[], bool], message: str, timeout: floa
         if loop.time() >= deadline:
             raise AssertionError(message)
         await asyncio.sleep(0.02)
-
-
-def _drain_inbox(queue: asyncio.Queue[dict[str, Any]]) -> list[dict[str, Any]]:
-    drained: list[dict[str, Any]] = []
-    while not queue.empty():
-        drained.append(queue.get_nowait())
-    return drained
 
 
 def _turn_frames(response_id: str) -> list[str]:
@@ -124,13 +117,33 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
         )
         assert reaped == [entry]
         assert entry.status == "failed"
-        reaper_payload = inbox.get_nowait()
-        assert reaper_payload["status"] == "failed"
-        assert "no start acknowledgment" in str(reaper_payload["output"])
-        assert inbox.empty()
         await _wait_until(
             lambda: any("finished (failed)" in notice for notice in server_client.wakes()),
             "the reaper's failure never woke the parent",
+        )
+        # The parent reads the notice through the production drain, exactly as
+        # its wake turn would.
+        notice = await execute_tool(
+            tool_name="sys_read_inbox",
+            arguments="{}",
+            server_client=server_client,  # type: ignore[arg-type]
+            conversation_id=parent_id,
+            session_inbox=inbox,
+        )
+        assert "no start acknowledgment" in notice, notice
+        assert inbox.empty()
+        # That failure is only the reaper's guess, so draining it must not
+        # finalize the dispatch: the entry stays registered (still flagged) and
+        # no delivered receipt is written, or the child's real edge that follows
+        # is acknowledged as "already delivered" and dropped.
+        assert subagent_work.get_subagent_work(child_id) is entry, (
+            "draining the reaper's guess unregistered the dispatch, so the child's "
+            "real completion can no longer replace it"
+        )
+        assert entry.launch_timed_out
+        assert server_client.label_patches == [], (
+            "draining the reaper's guess wrote a delivered receipt, so a runner "
+            "restart would never recover the child's real result either"
         )
 
         async with _runner_client(app) as client:
@@ -180,22 +193,30 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
                 f"was dropped and the stale reaper text kept."
             )
 
-            delivered_completions = [
-                item for item in _drain_inbox(inbox) if item.get("status") == "completed"
-            ]
-            assert delivered_completions, (
-                "the parent inbox never received the child's completion: the "
-                "reaper's failed guess blocked delivery of the real result, so the "
-                "parent hangs forever with the report unread."
-            )
-            assert final_report in str(delivered_completions[-1]["output"])
-
             await _wait_until(
                 lambda: len(server_client.wakes()) > wakes_before_completion,
                 "the parent was never woken for the completion: the wake POST is "
                 "the sole signal that rouses an idle parent to drain its inbox.",
             )
             assert "finished (completed)" in server_client.wakes()[-1]
+
+            report = await execute_tool(
+                tool_name="sys_read_inbox",
+                arguments="{}",
+                server_client=server_client,  # type: ignore[arg-type]
+                conversation_id=parent_id,
+                session_inbox=inbox,
+            )
+            assert final_report in report, (
+                "the parent inbox never received the child's completion: the "
+                f"reaper's failed guess blocked delivery of the real result. Drain: {report!r}"
+            )
+            # The genuine result finalizes what the guess deferred: the dispatch
+            # is unregistered and its delivered receipt written.
+            assert subagent_work.get_subagent_work(child_id) is None
+            assert server_client.label_patches == [
+                {subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY: entry.work_id}
+            ]
     finally:
         subagent_work.unregister_subagent_work(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
